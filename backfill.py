@@ -17,6 +17,7 @@ import asyncio
 import logging
 from typing import Optional
 
+import aiohttp
 import discord
 
 from db import Database
@@ -33,6 +34,35 @@ BACKFILL_DELAY_SECONDS = 30 / 19
 # Give up on a retryable failure after this many attempts across backfill
 # runs, rather than queuing it forever.
 MAX_RETRY_ATTEMPTS = 3
+
+# Connection drops worth automatically resuming from instead of leaving the
+# operator to notice and re-run !backfill -- most commonly the machine
+# running the bot going to sleep mid-backfill and waking back up to a
+# stale/timed-out connection, or a transient network blip. discord.py
+# already retries rate limits, connection resets, and 5xx responses
+# internally (see HTTPClient.request); what reaches us here is the stuff it
+# gives up on: outright timeouts (TimeoutError is an OSError subclass),
+# aiohttp-level connection errors, gateway drops, and a 5xx that's still
+# happening after discord.py's own retries -- relay._classify_http_failure
+# treats status >= 500 as retryable for the same reason.
+TRANSIENT_EXCEPTIONS = (
+    TimeoutError,
+    aiohttp.ClientError,
+    discord.ConnectionClosed,
+    discord.GatewayNotFound,
+    discord.DiscordServerError,
+    OSError,
+)
+
+# Capped exponential backoff between reconnect attempts for a channel.
+TRANSIENT_RETRY_BASE_SECONDS = 5
+TRANSIENT_RETRY_MAX_SECONDS = 120
+
+# Give up on a channel (not the whole backfill run) after this many
+# *consecutive* transient failures -- progress is checkpointed after every
+# message either way, so a later !backfill still resumes right where this
+# left off.
+MAX_CONSECUTIVE_TRANSIENT_RETRIES = 8
 
 
 async def _retry_failed(
@@ -100,6 +130,12 @@ async def run_backfill(
     that initial pass. It's ignored on incremental (cursor-resumed) runs,
     since "most recent N" wouldn't have a stable meaning applied to just
     the messages posted since last time.
+
+    Also resumes automatically *within* a single run: a timeout or dropped
+    connection (e.g. the machine sleeping mid-backfill) is caught and
+    retried with backoff from the last checkpoint, up to
+    MAX_CONSECUTIVE_TRANSIENT_RETRIES per channel, instead of aborting the
+    whole command.
     """
     total_sent = 0
     total_skipped = 0
@@ -117,53 +153,109 @@ async def run_backfill(
             # (already_relayed only skips confirmed successes), so running
             # the retry queue first would double-attempt anything in it --
             # once here, once again in the walk -- burning through its
-            # retry budget twice as fast.
+            # retry budget twice as fast. Reset once up front only -- not on
+            # every reconnect below, or a retry after partial progress would
+            # wipe out the cursor it just made.
             await db.reset_cursor(source_channel_id)
-        else:
-            retried_ok, gave_up = await _retry_failed(bot, db, source_channel, dest_channel)
-            total_retried_ok += retried_ok
-            total_gave_up += gave_up
-        cursor = await db.get_cursor(source_channel_id)
 
-        after = discord.Object(id=cursor) if cursor is not None else None
-        limit = per_channel_limit if cursor is None else None
-        if cursor is not None and per_channel_limit is not None:
-            logger.info(
-                "#%s is resuming from a saved position; ignoring the message limit for this run.",
-                source_channel.name,
-            )
+        logger.info("Backfilling #%s -> #%s", source_channel.name, dest_channel.name)
 
-        logger.info(
-            "Backfilling #%s -> #%s%s", source_channel.name, dest_channel.name,
-            " (resuming)" if cursor is not None else "",
-        )
-        try:
-            async for message in source_channel.history(after=after, limit=limit, oldest_first=True):
-                if await db.already_relayed(message.id):
-                    total_skipped += 1
-                else:
-                    outcome = await relay_new_message(bot, db, message, dest_channel)
-                    if outcome is RelayOutcome.SENT:
-                        total_sent += 1
-                        await asyncio.sleep(BACKFILL_DELAY_SECONDS)
-                    elif outcome is RelayOutcome.SKIPPED:
+        # Captured once, before any reconnect: whether this is a fresh
+        # (uncursored) backfill of this channel decides whether
+        # per_channel_limit applies at all. remaining_limit is then carried
+        # across reconnects and counted down as messages are consumed, so a
+        # mid-run timeout can't turn `!backfill 200` into an unbounded walk
+        # just because the cursor is no longer None on re-entry.
+        had_cursor_at_start = (await db.get_cursor(source_channel_id)) is not None
+        remaining_limit = per_channel_limit if not had_cursor_at_start else None
+        if had_cursor_at_start:
+            if per_channel_limit is not None:
+                logger.info(
+                    "#%s is resuming from a saved position; ignoring the message limit for this run.",
+                    source_channel.name,
+                )
+            else:
+                logger.info("#%s is resuming from a saved position.", source_channel.name)
+
+        consecutive_failures = 0
+        # Drain the failed-message queue at most once per !backfill run, not
+        # once per reconnect -- otherwise a message stuck at
+        # FAILED_RETRYABLE gets record_failure()'d again on every
+        # reconnect, burning through MAX_RETRY_ATTEMPTS within a single run
+        # instead of across separate runs as intended. Only flips to True
+        # once _retry_failed actually returns, so a reconnect that
+        # interrupts the drain itself still finishes it (already-cleared
+        # entries are gone from the DB, so re-running is safe).
+        retry_queue_drained = full  # full=True skips the queue entirely
+        while True:
+            try:
+                if not retry_queue_drained:
+                    retried_ok, gave_up = await _retry_failed(bot, db, source_channel, dest_channel)
+                    total_retried_ok += retried_ok
+                    total_gave_up += gave_up
+                    retry_queue_drained = True
+
+                cursor = await db.get_cursor(source_channel_id)
+                after = discord.Object(id=cursor) if cursor is not None else None
+
+                if remaining_limit is not None and remaining_limit <= 0:
+                    break  # limit already satisfied before an earlier reconnect
+
+                async for message in source_channel.history(
+                    after=after, limit=remaining_limit, oldest_first=True
+                ):
+                    consecutive_failures = 0  # made progress -- reset the retry budget
+                    if remaining_limit is not None:
+                        remaining_limit -= 1
+                    if await db.already_relayed(message.id):
                         total_skipped += 1
-                    elif outcome is RelayOutcome.FAILED_RETRYABLE:
-                        total_failed += 1
-                        await db.record_failure(
-                            message.id, source_channel_id, dest_channel.id, "send failed (retryable)"
-                        )
-                        await asyncio.sleep(BACKFILL_DELAY_SECONDS)
-                    else:  # FAILED_PERMANENT
-                        total_failed += 1
-                        await asyncio.sleep(BACKFILL_DELAY_SECONDS)
+                    else:
+                        outcome = await relay_new_message(bot, db, message, dest_channel)
+                        if outcome is RelayOutcome.SENT:
+                            total_sent += 1
+                            await asyncio.sleep(BACKFILL_DELAY_SECONDS)
+                        elif outcome is RelayOutcome.SKIPPED:
+                            total_skipped += 1
+                        elif outcome is RelayOutcome.FAILED_RETRYABLE:
+                            total_failed += 1
+                            await db.record_failure(
+                                message.id, source_channel_id, dest_channel.id, "send failed (retryable)"
+                            )
+                            await asyncio.sleep(BACKFILL_DELAY_SECONDS)
+                        else:  # FAILED_PERMANENT
+                            total_failed += 1
+                            await asyncio.sleep(BACKFILL_DELAY_SECONDS)
 
-                # Advance the checkpoint regardless of outcome: a retryable
-                # failure is tracked (and retried) via failed_messages, not
-                # by re-walking history from here again next time.
-                await db.set_cursor(source_channel_id, message.id)
-        except discord.Forbidden:
-            logger.warning("Missing permission to read history in #%s; skipping.", source_channel.name)
+                    # Advance the checkpoint regardless of outcome: a retryable
+                    # failure is tracked (and retried) via failed_messages, not
+                    # by re-walking history from here again next time.
+                    await db.set_cursor(source_channel_id, message.id)
+                break  # finished this channel cleanly
+            except discord.Forbidden:
+                logger.warning("Missing permission to read history in #%s; skipping.", source_channel.name)
+                break
+            except TRANSIENT_EXCEPTIONS as exc:
+                consecutive_failures += 1
+                if consecutive_failures > MAX_CONSECUTIVE_TRANSIENT_RETRIES:
+                    logger.error(
+                        "Giving up on #%s after %d connection interruptions in a row; progress is "
+                        "checkpointed, so re-running !backfill later will resume from here.",
+                        source_channel.name, consecutive_failures - 1,
+                    )
+                    break
+                delay = min(
+                    TRANSIENT_RETRY_BASE_SECONDS * 2 ** (consecutive_failures - 1),
+                    TRANSIENT_RETRY_MAX_SECONDS,
+                )
+                logger.warning(
+                    "Connection interrupted while backfilling #%s (%s); auto-resuming from the last "
+                    "checkpoint in %ds (attempt %d/%d).",
+                    source_channel.name, exc, delay, consecutive_failures, MAX_CONSECUTIVE_TRANSIENT_RETRIES,
+                )
+                await asyncio.sleep(delay)
+                # Loop back around: cursor/failed_messages state was
+                # checkpointed as we went, so this just re-enters right
+                # after the last message (or retry) that made it through.
 
     summary = f"{total_sent} sent, {total_skipped} skipped, {total_failed} failed"
     if total_retried_ok or total_gave_up:
