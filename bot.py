@@ -1,5 +1,5 @@
-"""Entry point: connects to Discord, wires up event handlers, and exposes the
-owner-only !backfill command.
+"""Entry point: connects to Discord, wires up event handlers, and exposes
+owner-only history and live-sync commands.
 
 Run with:  python bot.py
 """
@@ -58,6 +58,12 @@ db = Database()
 # source_channel_id -> destination TextChannel, rebuilt on_ready and via !resync
 channel_map: dict[int, discord.TextChannel] = {}
 
+# `!livesync` can enable live relaying without changing the on-disk config.
+# Keeping this separate from the frozen Config makes that choice explicitly
+# session-scoped: restart the bot to return to ENABLE_LIVE_RELAY's value.
+live_relay_enabled = cfg.live_relay_enabled
+livesync_lock = asyncio.Lock()
+
 
 def _rebuild_channel_map() -> None:
     global channel_map
@@ -80,7 +86,7 @@ def _rebuild_channel_map() -> None:
 
 @bot.check
 async def _commands_only_in_dest_guild(ctx: commands.Context) -> bool:
-    # Owner commands (!backfill, !resync, !clone-emojis, !help) only work
+    # Owner commands (!backfill, !livesync, !resync, !clone-emojis, !help) only work
     # when invoked from the destination server, so the source server's
     # members never see or trigger them.
     return ctx.guild is not None and ctx.guild.id == cfg.dest_guild_id
@@ -98,7 +104,7 @@ async def on_ready() -> None:
     _rebuild_channel_map()
     logger.info(
         "Live message relay is %s.",
-        "ENABLED" if cfg.live_relay_enabled else "DISABLED (set ENABLE_LIVE_RELAY=true in .env to turn on; "
+        "ENABLED" if live_relay_enabled else "DISABLED (set ENABLE_LIVE_RELAY=true in .env to turn on; "
         "until then only !backfill sends messages)",
     )
     logger.info("Logged in as %s (id=%s). Ready.", bot.user, bot.user.id)
@@ -108,7 +114,7 @@ async def on_ready() -> None:
 async def on_message(message: discord.Message) -> None:
     await bot.process_commands(message)
 
-    if not cfg.live_relay_enabled:
+    if not live_relay_enabled:
         return
     if message.guild is None or message.guild.id != cfg.source_guild_id:
         return
@@ -123,35 +129,35 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent) -> None:
     # Use the raw event (not on_message_edit) so edits to messages sent
     # before this process started, or evicted from the message cache, still
     # sync -- that's the whole reason the mapping is persisted in SQLite.
-    if payload.guild_id != cfg.source_guild_id:
+    if not live_relay_enabled or payload.guild_id != cfg.source_guild_id:
         return
     await relay_edit_from_payload(bot, db, payload)
 
 
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
-    if payload.guild_id != cfg.source_guild_id:
+    if not live_relay_enabled or payload.guild_id != cfg.source_guild_id:
         return
     await relay_reaction_add(bot, db, payload)
 
 
 @bot.event
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> None:
-    if payload.guild_id != cfg.source_guild_id:
+    if not live_relay_enabled or payload.guild_id != cfg.source_guild_id:
         return
     await relay_reaction_remove(bot, db, payload)
 
 
 @bot.event
 async def on_raw_reaction_clear(payload: discord.RawReactionClearEvent) -> None:
-    if payload.guild_id != cfg.source_guild_id:
+    if not live_relay_enabled or payload.guild_id != cfg.source_guild_id:
         return
     await relay_reaction_clear(bot, db, payload)
 
 
 @bot.event
 async def on_raw_reaction_clear_emoji(payload: discord.RawReactionClearEmojiEvent) -> None:
-    if payload.guild_id != cfg.source_guild_id:
+    if not live_relay_enabled or payload.guild_id != cfg.source_guild_id:
         return
     await relay_reaction_clear_emoji(bot, db, payload)
 
@@ -219,6 +225,43 @@ async def backfill_cmd(ctx: commands.Context, arg: Optional[str] = None) -> None
     )
     summary = await run_backfill(bot, db, channel_map, per_channel_limit=limit, full=full)
     await ctx.reply(f"Backfill complete: {summary}")
+
+
+@bot.command(name="livesync")
+@commands.is_owner()
+async def livesync_cmd(ctx: commands.Context) -> None:
+    """Owner-only: backfill history, then keep relaying new source activity.
+
+    Live relaying is enabled before the backfill starts so messages sent while
+    history is being copied cannot slip through the gap. Duplicate relays are
+    avoided by the persistent source-message map.
+    """
+    global live_relay_enabled
+
+    async with livesync_lock:
+        if not channel_map:
+            await ctx.reply(
+                "Channel map is empty -- is the bot in both guilds, and do any channel names match?"
+            )
+            return
+
+        was_live = live_relay_enabled
+        live_relay_enabled = True
+        if was_live:
+            await ctx.reply(
+                f"Live relay is already enabled. Starting backfill across {len(channel_map)} channel(s)..."
+            )
+        else:
+            await ctx.reply(
+                f"Live relay enabled. Starting backfill across {len(channel_map)} channel(s); "
+                "new source messages will sync while it runs."
+            )
+
+        summary = await run_backfill(bot, db, channel_map)
+        await ctx.reply(
+            f"Live sync ready: backfill complete: {summary} New source messages will continue syncing "
+            "until the bot restarts."
+        )
 
 
 @bot.command(name="clone-emojis")

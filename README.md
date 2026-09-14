@@ -61,7 +61,8 @@ author's name and avatar.
 - Emoji cloning stops once the destination server's static/animated emoji
   slots are full (capped by its boost level); `!clone-emojis` reports how
   many failed rather than erroring out.
-- Owner commands (`!backfill`, `!resync`, `!clone-emojis`, `!help`) only
+- Owner commands (`!backfill`, `!livesync`, `!resync`, `!clone-emojis`,
+  `!help`) only
   work when typed in the **destination** server — they're silently ignored
   if typed in the source server, so source-server members never see them.
 
@@ -134,11 +135,19 @@ channel the bot can see:
 !backfill          # resume from each channel's last backfill (full history the first time)
 !backfill 200       # on a channel's first backfill, copy only the 200 most recent messages
 !backfill full       # ignore saved progress and rescan every channel's full history
+!livesync            # backfill, then relay new messages for this bot session
 ```
 
 Safe to re-run — already-relayed messages (tracked in `relay.db`) are
-skipped. This is the only thing that sends messages unless you've set
-`ENABLE_LIVE_RELAY=true`.
+skipped. `!backfill` is the only history-only option; use
+`ENABLE_LIVE_RELAY=true` or `!livesync` when new messages should continue
+relaying too.
+
+`!livesync` turns on live message, edit, and reaction relaying for the
+current bot process, then runs the normal resumable backfill. Live relaying
+starts immediately (before the history walk) so messages posted during a
+long backfill are not missed. It remains on until the bot restarts; after a
+restart, `ENABLE_LIVE_RELAY` again controls whether it starts enabled.
 
 Re-running `!backfill` doesn't rescan history from the start: each
 channel's progress (the last source message id it walked) is checkpointed
