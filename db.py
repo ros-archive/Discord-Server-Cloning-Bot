@@ -73,6 +73,11 @@ class Database:
                 attempts INTEGER NOT NULL DEFAULT 1,
                 last_error TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             """
         )
         self._conn.commit()
@@ -312,6 +317,35 @@ class Database:
 
     def _clear_failure(self, source_message_id: int) -> None:
         self._conn.execute("DELETE FROM failed_messages WHERE source_message_id = ?", (source_message_id,))
+        self._conn.commit()
+
+    # --- settings (small persistent key/value store) ----------------------
+
+    async def get_setting(self, key: str) -> Optional[str]:
+        return await asyncio.to_thread(self._get_setting, key)
+
+    def _get_setting(self, key: str) -> Optional[str]:
+        row = self._conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    async def set_setting(self, key: str, value: str) -> None:
+        await asyncio.to_thread(self._set_setting, key, value)
+
+    def _set_setting(self, key: str, value: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO settings (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+        self._conn.commit()
+
+    async def delete_setting(self, key: str) -> None:
+        await asyncio.to_thread(self._delete_setting, key)
+
+    def _delete_setting(self, key: str) -> None:
+        self._conn.execute("DELETE FROM settings WHERE key = ?", (key,))
         self._conn.commit()
 
     def close(self) -> None:

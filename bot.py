@@ -62,7 +62,41 @@ channel_map: dict[int, discord.TextChannel] = {}
 # Keeping this separate from the frozen Config makes that choice explicitly
 # session-scoped: restart the bot to return to ENABLE_LIVE_RELAY's value.
 live_relay_enabled = cfg.live_relay_enabled
-livesync_lock = asyncio.Lock()
+livesync_task: Optional[asyncio.Task] = None
+
+# Persisted in relay.db while a livesync is active, so a restart/crash resumes
+# it automatically. Value = id of the channel to report progress in. Cleared
+# only by !stoplivesync / !stopsync.
+LIVESYNC_SETTING = "livesync_channel_id"
+
+
+def _livesync_running() -> bool:
+    return livesync_task is not None and not livesync_task.done()
+
+
+async def _notify(channel_id: int, text: str) -> None:
+    channel = bot.get_channel(channel_id)
+    if channel is not None:
+        try:
+            await channel.send(text)
+        except discord.HTTPException as exc:
+            logger.warning("Could not post livesync status: %s", exc)
+
+
+async def _livesync_job(channel_id: int, resumed: bool) -> None:
+    summary = await run_backfill(bot, db, channel_map)
+    await _notify(
+        channel_id,
+        f"Live sync {'resumed: ' if resumed else 'ready: '}backfill complete: {summary} "
+        "New source messages will continue syncing until `!stoplivesync`.",
+    )
+
+
+async def _start_livesync(channel_id: int, resumed: bool) -> None:
+    global live_relay_enabled, livesync_task
+    live_relay_enabled = True
+    await db.set_setting(LIVESYNC_SETTING, str(channel_id))
+    livesync_task = asyncio.create_task(_livesync_job(channel_id, resumed))
 
 
 def _rebuild_channel_map() -> None:
@@ -107,6 +141,13 @@ async def on_ready() -> None:
         "ENABLED" if live_relay_enabled else "DISABLED (set ENABLE_LIVE_RELAY=true in .env to turn on; "
         "until then only !backfill sends messages)",
     )
+    # on_ready also fires after gateway reconnects; only resume if not already running.
+    saved = await db.get_setting(LIVESYNC_SETTING)
+    if saved is not None and not _livesync_running() and channel_map:
+        channel_id = int(saved)
+        logger.info("Livesync was active when the bot last stopped; resuming.")
+        await _notify(channel_id, "Bot restarted; resuming live sync...")
+        await _start_livesync(channel_id, resumed=True)
     logger.info("Logged in as %s (id=%s). Ready.", bot.user, bot.user.id)
 
 
@@ -234,34 +275,44 @@ async def livesync_cmd(ctx: commands.Context) -> None:
 
     Live relaying is enabled before the backfill starts so messages sent while
     history is being copied cannot slip through the gap. Duplicate relays are
-    avoided by the persistent source-message map.
+    avoided by the persistent source-message map. Survives bot restarts
+    (resumes automatically) until stopped with !stoplivesync / !stopsync.
     """
-    global live_relay_enabled
+    if _livesync_running():
+        await ctx.reply("Live sync is already running.")
+        return
+    if not channel_map:
+        await ctx.reply("Channel map is empty -- is the bot in both guilds, and do any channel names match?")
+        return
 
-    async with livesync_lock:
-        if not channel_map:
-            await ctx.reply(
-                "Channel map is empty -- is the bot in both guilds, and do any channel names match?"
-            )
-            return
+    await ctx.reply(
+        f"Live relay enabled. Starting backfill across {len(channel_map)} channel(s); "
+        "new source messages will sync while it runs. Use `!stoplivesync` to stop."
+    )
+    await _start_livesync(ctx.channel.id, resumed=False)
 
-        was_live = live_relay_enabled
-        live_relay_enabled = True
-        if was_live:
-            await ctx.reply(
-                f"Live relay is already enabled. Starting backfill across {len(channel_map)} channel(s)..."
-            )
-        else:
-            await ctx.reply(
-                f"Live relay enabled. Starting backfill across {len(channel_map)} channel(s); "
-                "new source messages will sync while it runs."
-            )
 
-        summary = await run_backfill(bot, db, channel_map)
-        await ctx.reply(
-            f"Live sync ready: backfill complete: {summary} New source messages will continue syncing "
-            "until the bot restarts."
-        )
+@bot.command(name="stoplivesync", aliases=["stopsync"])
+@commands.is_owner()
+async def stoplivesync_cmd(ctx: commands.Context) -> None:
+    """Owner-only: stop live sync (cancels a running backfill and disables live relaying)."""
+    global live_relay_enabled, livesync_task
+
+    was_active = (await db.get_setting(LIVESYNC_SETTING)) is not None or _livesync_running()
+    await db.delete_setting(LIVESYNC_SETTING)
+    task, livesync_task = livesync_task, None
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    live_relay_enabled = cfg.live_relay_enabled
+
+    if not was_active:
+        await ctx.reply("No live sync is running.")
+    else:
+        await ctx.reply("Live sync stopped. It won't resume on restart; run `!livesync` to start again.")
 
 
 @bot.command(name="clone-emojis")

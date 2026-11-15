@@ -86,7 +86,7 @@ async def _retry_failed(
             logger.warning("Could not re-fetch message %s for retry: %s", failed.source_message_id, exc)
             continue
 
-        outcome = await relay_new_message(bot, db, message, dest_channel)
+        outcome = await asyncio.shield(relay_new_message(bot, db, message, dest_channel))
         await asyncio.sleep(BACKFILL_DELAY_SECONDS)
 
         if outcome in (RelayOutcome.SENT, RelayOutcome.SKIPPED):
@@ -210,7 +210,9 @@ async def run_backfill(
                     if await db.already_relayed(message.id):
                         total_skipped += 1
                     else:
-                        outcome = await relay_new_message(bot, db, message, dest_channel)
+                        # shield: if the run is cancelled (!stoplivesync) mid-send, the
+                        # send still finishes and is recorded, so resuming can't duplicate it.
+                        outcome = await asyncio.shield(relay_new_message(bot, db, message, dest_channel))
                         if outcome is RelayOutcome.SENT:
                             total_sent += 1
                             await asyncio.sleep(BACKFILL_DELAY_SECONDS)

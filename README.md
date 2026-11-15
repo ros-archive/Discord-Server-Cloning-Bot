@@ -135,7 +135,8 @@ channel the bot can see:
 !backfill          # resume from each channel's last backfill (full history the first time)
 !backfill 200       # on a channel's first backfill, copy only the 200 most recent messages
 !backfill full       # ignore saved progress and rescan every channel's full history
-!livesync            # backfill, then relay new messages for this bot session
+!livesync            # backfill, then keep relaying new messages (resumes after restarts)
+!stoplivesync        # stop a running livesync (alias: !stopsync)
 ```
 
 Safe to re-run — already-relayed messages (tracked in `relay.db`) are
@@ -143,11 +144,13 @@ skipped. `!backfill` is the only history-only option; use
 `ENABLE_LIVE_RELAY=true` or `!livesync` when new messages should continue
 relaying too.
 
-`!livesync` turns on live message, edit, and reaction relaying for the
-current bot process, then runs the normal resumable backfill. Live relaying
+`!livesync` turns on live message, edit, and reaction relaying, then runs the normal resumable backfill. Live relaying
 starts immediately (before the history walk) so messages posted during a
-long backfill are not missed. It remains on until the bot restarts; after a
-restart, `ENABLE_LIVE_RELAY` again controls whether it starts enabled.
+long backfill are not missed. The livesync state is saved in `relay.db`, so
+if the bot is stopped or crashes it resumes automatically on the next start
+(catching up via the checkpointed backfill). `!stoplivesync` / `!stopsync`
+cancels a running backfill, turns live relaying off (back to
+`ENABLE_LIVE_RELAY`'s value), and prevents resuming on restart.
 
 Re-running `!backfill` doesn't rescan history from the start: each
 channel's progress (the last source message id it walked) is checkpointed
