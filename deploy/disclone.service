@@ -1,0 +1,15 @@
+[Unit]
+Description=Disclone Discord relay bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/disclone
+ExecStart=%h/disclone/.venv/bin/python %h/disclone/bot.py
+Restart=on-failure
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

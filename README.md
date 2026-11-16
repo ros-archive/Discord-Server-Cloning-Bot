@@ -30,6 +30,9 @@ author's name and avatar.
   checkpointed, so a re-run resumes from where the last one left off
   instead of rescanning the channel's entire history -- see
   [Backfilling existing history](#5-backfill-existing-history).
+- `!livesync` enables live relaying and runs the resumable backfill; it
+  resumes automatically after a restart until `!stoplivesync`.
+  `ENABLE_LIVE_RELAY=true` in `.env` enables live relaying on every startup.
 - Custom emojis are cloned from the source server into the destination
   server, so destination members can actually use them (react, type them),
   not just see them rendered in relayed content. `!clone-emojis` backfills
@@ -106,8 +109,8 @@ automatically as they're posted, in addition to `!backfill`.
 ### 4. Install and run
 
 ```bash
-python -m venv venv
-source venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 python bot.py
 ```
@@ -125,6 +128,28 @@ that don't exist (by name) in the destination server are skipped and
 logged — create them there and run `!resync` (as the bot owner, in any
 channel it can see) to pick them up without restarting.
 
+#### Run in the background at startup (Linux with systemd)
+
+Install the user service from the repository directory:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp deploy/disclone.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now disclone.service
+```
+
+The service runs `.venv/bin/python bot.py` from `~/disclone`, reads the
+repository's `.env`, and restarts if the bot exits unexpectedly. If the
+repository is in a different location or the virtual environment has a
+different name, edit `WorkingDirectory` and `ExecStart` in the copied unit
+first.
+To have the user service start at boot without an interactive login, enable
+systemd lingering for your account with `loginctl enable-linger "$USER"`
+(this may require administrator privileges). Use
+`systemctl --user status disclone` and `journalctl --user -u disclone -f`
+to inspect it; `systemctl --user disable --now disclone` stops and disables it.
+
 ### 5. Backfill existing history
 
 Commands only work when typed **in the destination server** (they're
@@ -137,6 +162,7 @@ channel the bot can see:
 !backfill full       # ignore saved progress and rescan every channel's full history
 !livesync            # backfill, then keep relaying new messages (resumes after restarts)
 !stoplivesync        # stop a running livesync (alias: !stopsync)
+!fileout 10 100      # export messages 11th-100th most recent in this channel as a .txt file
 ```
 
 Safe to re-run — already-relayed messages (tracked in `relay.db`) are

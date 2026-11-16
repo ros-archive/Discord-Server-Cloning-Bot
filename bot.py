@@ -1,5 +1,5 @@
 """Entry point: connects to Discord, wires up event handlers, and exposes
-owner-only history and live-sync commands.
+owner-only history, live-sync and export commands.
 
 Run with:  python bot.py
 """
@@ -19,6 +19,7 @@ import certifi
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 
 import asyncio  # noqa: E402
+import io  # noqa: E402
 import logging  # noqa: E402
 from typing import Optional  # noqa: E402
 
@@ -120,7 +121,7 @@ def _rebuild_channel_map() -> None:
 
 @bot.check
 async def _commands_only_in_dest_guild(ctx: commands.Context) -> bool:
-    # Owner commands (!backfill, !livesync, !resync, !clone-emojis, !help) only work
+    # Owner commands (!backfill, !livesync, !fileout, !resync, !clone-emojis, !help) only work
     # when invoked from the destination server, so the source server's
     # members never see or trigger them.
     return ctx.guild is not None and ctx.guild.id == cfg.dest_guild_id
@@ -153,6 +154,20 @@ async def on_ready() -> None:
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
+    # Delete owner commands as soon as they're read (before they run), so
+    # the invoking message disappears even for long-running commands. Replies
+    # use ctx.send, not ctx.reply, since the message they'd reference is gone.
+    if (
+        message.guild is not None
+        and message.guild.id == cfg.dest_guild_id
+        and await bot.is_owner(message.author)
+        and (await bot.get_context(message)).valid
+    ):
+        try:
+            await message.delete()
+        except discord.HTTPException as exc:  # needs Manage Messages
+            logger.warning("Could not delete command message: %s", exc)
+
     await bot.process_commands(message)
 
     if not live_relay_enabled:
@@ -226,7 +241,7 @@ async def on_guild_emojis_update(
 async def resync_cmd(ctx: commands.Context) -> None:
     """Owner-only: rebuild the source->destination channel name map (e.g. after adding channels)."""
     _rebuild_channel_map()
-    await ctx.reply(f"Rebuilt channel map: {len(channel_map)} channel(s) matched.")
+    await ctx.send(f"Rebuilt channel map: {len(channel_map)} channel(s) matched.")
 
 
 @bot.command(name="backfill")
@@ -246,7 +261,7 @@ async def backfill_cmd(ctx: commands.Context, arg: Optional[str] = None) -> None
     relay.db) are skipped, and normal runs resume instead of rescanning.
     """
     if not channel_map:
-        await ctx.reply("Channel map is empty -- is the bot in both guilds, and do any channel names match?")
+        await ctx.send("Channel map is empty -- is the bot in both guilds, and do any channel names match?")
         return
 
     full = False
@@ -258,14 +273,14 @@ async def backfill_cmd(ctx: commands.Context, arg: Optional[str] = None) -> None
             try:
                 limit = int(arg)
             except ValueError:
-                await ctx.reply(f"Usage: `{cfg.command_prefix}backfill [limit|full]`")
+                await ctx.send(f"Usage: `{cfg.command_prefix}backfill [limit|full]`")
                 return
 
-    await ctx.reply(
+    await ctx.send(
         f"Starting {'full ' if full else ''}backfill across {len(channel_map)} channel(s)... this may take a while."
     )
     summary = await run_backfill(bot, db, channel_map, per_channel_limit=limit, full=full)
-    await ctx.reply(f"Backfill complete: {summary}")
+    await ctx.send(f"Backfill complete: {summary}")
 
 
 @bot.command(name="livesync")
@@ -279,13 +294,13 @@ async def livesync_cmd(ctx: commands.Context) -> None:
     (resumes automatically) until stopped with !stoplivesync / !stopsync.
     """
     if _livesync_running():
-        await ctx.reply("Live sync is already running.")
+        await ctx.send("Live sync is already running.")
         return
     if not channel_map:
-        await ctx.reply("Channel map is empty -- is the bot in both guilds, and do any channel names match?")
+        await ctx.send("Channel map is empty -- is the bot in both guilds, and do any channel names match?")
         return
 
-    await ctx.reply(
+    await ctx.send(
         f"Live relay enabled. Starting backfill across {len(channel_map)} channel(s); "
         "new source messages will sync while it runs. Use `!stoplivesync` to stop."
     )
@@ -310,9 +325,64 @@ async def stoplivesync_cmd(ctx: commands.Context) -> None:
     live_relay_enabled = cfg.live_relay_enabled
 
     if not was_active:
-        await ctx.reply("No live sync is running.")
+        await ctx.send("No live sync is running.")
     else:
-        await ctx.reply("Live sync stopped. It won't resume on restart; run `!livesync` to start again.")
+        await ctx.send("Live sync stopped. It won't resume on restart; run `!livesync` to start again.")
+
+
+@bot.command(name="fileout")
+@commands.is_owner()
+async def fileout_cmd(ctx: commands.Context, newest: int, oldest: int) -> None:
+    """Owner-only: export a range of this channel's messages as a .txt file.
+
+    Positions count back from the most recent message (not counting the
+    command itself): `!fileout 10 100` skips the 10 most recent messages and
+    exports the 90 before them, i.e. the 100th-most-recent up to the
+    11th-most-recent, oldest first.
+    """
+    if newest < 0 or oldest <= newest:
+        await ctx.send(f"Usage: `{cfg.command_prefix}fileout <newest> <oldest>` with 0 <= newest < oldest, e.g. `{cfg.command_prefix}fileout 10 100`.")
+        return
+
+    count = oldest - newest
+    async with ctx.typing():
+        msgs: list[discord.Message] = []
+        i = 0
+        async for m in ctx.channel.history(limit=oldest, before=ctx.message):
+            if i >= newest:
+                msgs.append(m)
+            i += 1
+        msgs.reverse()  # oldest first, like reading the channel
+
+        lines: list[str] = []
+        for m in msgs:
+            ts = m.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+            body = m.content or ""
+            if m.edited_at:
+                body += " (edited)"
+            lines.append(f"[{ts}] {m.author.display_name}: {body}")
+            for a in m.attachments:
+                lines.append(f"    [attachment] {a.filename}: {a.url}")
+            for e in m.embeds:
+                desc = " | ".join(x for x in (e.title, e.description, e.url) if x)
+                if desc:
+                    lines.append(f"    [embed] {desc}")
+        data = "\n".join(lines).encode("utf-8")
+
+    if not msgs:
+        await ctx.send("No messages in that range.")
+        return
+
+    limit = ctx.guild.filesize_limit if ctx.guild else 8 * 1024 * 1024
+    if len(data) > limit:
+        await ctx.send(f"Export is {len(data) / 1e6:.1f} MB, over this server's {limit / 1e6:.0f} MB upload limit -- try a smaller range.")
+        return
+
+    name = f"{ctx.channel.name}_{newest}-{oldest}.txt"
+    await ctx.send(
+        f"{len(msgs)} message(s) (requested {count}).",
+        file=discord.File(io.BytesIO(data), filename=name),
+    )
 
 
 @bot.command(name="clone-emojis")
@@ -326,11 +396,11 @@ async def clone_emojis_cmd(ctx: commands.Context) -> None:
     source_guild = bot.get_guild(cfg.source_guild_id)
     dest_guild = bot.get_guild(cfg.dest_guild_id)
     if source_guild is None or dest_guild is None:
-        await ctx.reply("Bot isn't a member of both configured guilds.")
+        await ctx.send("Bot isn't a member of both configured guilds.")
         return
-    await ctx.reply(f"Cloning up to {len(source_guild.emojis)} emoji(s) into {dest_guild.name}...")
+    await ctx.send(f"Cloning up to {len(source_guild.emojis)} emoji(s) into {dest_guild.name}...")
     summary = await sync_emojis(db, source_guild, dest_guild)
-    await ctx.reply(f"Emoji clone complete: {summary}")
+    await ctx.send(f"Emoji clone complete: {summary}")
 
 
 def main() -> None:
